@@ -7,12 +7,12 @@ set -eu
 B=${1%/}; U=$2; P=$3; MODE=${4:-create}
 J=$(mktemp); trap 'rm "$J"' EXIT
 # Web login (CSRF form)
-page=$(curl -fsS -c "$J" -b "$J" "$B/login")
+page=$(curl -fsS -c "$J" -b "$J" "$B/")
 csrf=$(printf '%s' "$page" | sed -n 's/.*name="_csrf_token" value="\([^"]*\)".*/\1/p' | head -1)
-code=$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' -c "$J" -b "$J" -H "Origin: $B" -H "Referer: $B/login" \
-  --data-urlencode "_login=$U" --data-urlencode "_password=$P" --data-urlencode "_csrf_token=$csrf" "$B/login")
+code=$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' -c "$J" -b "$J" -H "Origin: $B" -H "Referer: $B/" \
+  --data-urlencode "_login=$U" --data-urlencode "_password=$P" --data-urlencode "_csrf_token=$csrf" "$B/")
 echo "web login: $code"
-case "$code" in 302*login*) echo "web login FAILED"; exit 1;; esac
+case "$code" in 302*/|302*/?*login*) echo "web login FAILED"; exit 1;; esac
 curl -fsS -b "$J" -o /dev/null -w "dashboard %{http_code}\n" "$B/collections"
 # API login (JWT)
 tok=$(curl -fsS -H 'Content-Type: application/json' -d "{\"username\":\"$U\",\"password\":\"$P\"}" "$B/api/authentication_token" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
