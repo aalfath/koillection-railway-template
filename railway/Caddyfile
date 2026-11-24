@@ -35,8 +35,11 @@
 
 	# Health check for Railway: renders the login page, which also queries the database.
 	handle /healthz {
-		rewrite * /
-		php_server
+		reverse_proxy 127.0.0.1:{$PORT:8080} {
+			rewrite /
+			header_up -Cookie
+			header_down -Set-Cookie
+		}
 	}
 
 	handle /uploads/* {
