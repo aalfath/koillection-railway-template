@@ -1,59 +1,59 @@
 #!/bin/bash
 # Mirrors /uploads to the Railway Bucket file by file (never a whole-tree "sync",
 # so an older container can't delete files a newer one wrote).
-# Changes are batched every 2 s; a full copy (no deletes) runs every 10 minutes.
+# Events from inotifywait are batched until 2 s pass with no new event, then the
+# changed files are copied and deleted files removed. A full copy (no deletes)
+# also runs every 10 minutes as a safety net. Exits 1 if the watcher stops.
 set -uo pipefail
-Q=/tmp/uploads-sync.queue
-: > "$Q"
 log() { echo "[uploads-sync] $*"; }
-
-inotifywait -m -r -q -e close_write,moved_to,delete,moved_from,create --format '%e|%w%f' /uploads >> "$Q" &
-watcher=$!
+B=/tmp/uploads-sync.batch UP=/tmp/uploads-sync.up DEL=/tmp/uploads-sync.del
+: > "$B"
 
 flush() {
-  [ -s "$Q" ] || return 0
-  local batch=/tmp/uploads-sync.batch up=/tmp/uploads-sync.up del=/tmp/uploads-sync.del
-  mv "$Q" "$batch"; : > "$Q"
-  : > "$up"; : > "$del"
-  cut -d'|' -f2- "$batch" | sort -u | while IFS= read -r path; do
+  [ -s "$B" ] || return 0
+  : > "$UP"; : > "$DEL"
+  cut -d'|' -f2- "$B" | sort -u | while IFS= read -r path; do
     rel="${path#/uploads/}"
     [ -n "$rel" ] && [ "$rel" != "$path" ] || continue
     case "$rel" in .railway-jwt/*) continue;; esac
     if [ -d "$path" ]; then
       # new folder: files written before its watch existed are caught here
-      (cd /uploads && find "$rel" -type f) >> "$up"
-    elif [ -f "$path" ]; then echo "$rel" >> "$up"
-    elif [ ! -e "$path" ]; then echo "$rel" >> "$del"; fi
+      (cd /uploads && find "$rel" -type f) >> "$UP"
+    elif [ -f "$path" ]; then echo "$rel" >> "$UP"
+    elif [ ! -e "$path" ]; then echo "$rel" >> "$DEL"; fi
   done
+  sort -u -o "$UP" "$UP"
   local rc=0
-  if [ -s "$up" ]; then
-    sort -u -o "$up" "$up"
-    rclone copy /uploads "$RCLONE_REMOTE/uploads" --files-from-raw "$up" --no-traverse -q || rc=1
+  if [ -s "$UP" ]; then
+    rclone copy /uploads "$RCLONE_REMOTE/uploads" --files-from-raw "$UP" --no-traverse -q || rc=1
   fi
-  if [ -s "$del" ]; then
-    rclone delete "$RCLONE_REMOTE/uploads" --files-from-raw "$del" --no-traverse -q || rc=1
+  if [ -s "$DEL" ]; then
+    rclone delete "$RCLONE_REMOTE/uploads" --files-from-raw "$DEL" --no-traverse -q || rc=1
   fi
   if [ "$rc" -ne 0 ]; then
-    log "bucket write failed; will retry"
-    cat "$batch" >> "$Q"
-  else
-    log "saved $(wc -l < "$up") file(s), removed $(wc -l < "$del") file(s)"
+    log "bucket write failed; will retry with the next change or the 10-minute copy"
+    return 0
   fi
-  rm "$batch" 2>/dev/null
-  return 0
+  log "saved $(wc -l < "$UP") file(s), removed $(wc -l < "$DEL") file(s)"
+  : > "$B"
 }
 
-stop() { kill "$watcher" 2>/dev/null; sleep 0.5; flush; exit 0; }
-trap stop TERM INT
+full_copy() {
+  rclone copy /uploads "$RCLONE_REMOTE/uploads" --exclude '.railway-jwt/**' -q || log "periodic copy failed"
+}
 
-n=0
+trap 'flush; exit 0' TERM INT
+last_full=$SECONDS
 while :; do
-  kill -0 "$watcher" 2>/dev/null || { log "inotifywait stopped"; flush; exit 1; }
-  sleep 2 & wait $!
-  flush
-  n=$(( n + 1 ))
-  if [ "$n" -ge 300 ]; then
-    n=0
-    rclone copy /uploads "$RCLONE_REMOTE/uploads" --exclude '.railway-jwt/**' -q || log "periodic copy failed"
+  r=0
+  IFS= read -r -t 2 line || r=$?
+  if [ "$r" -eq 0 ]; then
+    printf '%s\n' "$line" >> "$B"
+    # keep collecting while events keep coming, but flush at least every 30 s
+    [ "$(wc -l < "$B")" -lt 5000 ] && [ $(( SECONDS - ${batch_start:=$SECONDS} )) -lt 30 ] && continue
+  elif [ "$r" -le 128 ]; then
+    log "inotifywait stopped"; flush; exit 1
   fi
-done
+  flush; unset batch_start
+  if [ $(( SECONDS - last_full )) -ge 600 ]; then full_copy; last_full=$SECONDS; fi
+done < <(inotifywait -m -r -q -e close_write,moved_to,delete,moved_from,create --format '%e|%w%f' /uploads)
